@@ -1,0 +1,32 @@
+# Virtual Environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE settings
+.idea/
+*.iml
+.vscode/
+
+# Database files
+data/*.db
+*.db
+
+# Logs (folder-level — catches active log AND rotated backups
+# like collector.log.1, collector.log.2, which *.log alone misses)
+logs/
+*.log
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Environment variables / secrets (not used yet, ignored preemptively)
+.env
+
+# OS junk
+.DS_Store
+Thumbs.db
