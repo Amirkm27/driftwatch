@@ -1,10 +1,13 @@
 """
-Collects system health metrics using psutil (+ GPU via pynvml/pyadl) and
-writes them to SQLite. Disk/network I/O are converted from psutil's
-cumulative counters into per-second rates at collection time.
+Pulls system metrics via psutil (+ GPU via pynvml/pyadl, + CPU temp via
+HardView) and writes them to SQLite. Disk/network numbers come out of
+psutil as running totals since boot, not rates — converted to MB/s here,
+see get_io_rates().
 """
 import os
 import time
+import platform
+import socket
 import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -12,29 +15,37 @@ from datetime import datetime, timezone
 
 import psutil
 
-from src.database import init_db, insert_metric, TOP_N_PROCESSES
+from src.database import init_db, insert_metric, insert_system_info, TOP_N_PROCESSES
 
-# --- Logging setup ---
+# --- logging: console + rotating file. leaving at DEBUG for now while
+# I'm still chasing the GPU null issue — bump back to INFO once that's
+# actually confirmed fixed, DEBUG is way too noisy for a week-long run ---
 LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
 logger = logging.getLogger("driftwatch.collector")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 _console_handler = logging.StreamHandler()
 _file_handler = RotatingFileHandler(LOG_DIR / "collector.log", maxBytes=5_000_000, backupCount=3)
 _formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
 _console_handler.setFormatter(_formatter)
 _file_handler.setFormatter(_formatter)
-_EXCLUDED_PROCESS_NAMES = {"System Idle Process", "Idle"}  # Windows/Linux idle placeholders
 
 if not logger.handlers:
     logger.addHandler(_console_handler)
     logger.addHandler(_file_handler)
 
+# "System Idle Process" reports something like 1400%+ CPU on a multicore
+# box (psutil quirk, not normalized) and camps in the #1 slot every single
+# snapshot — zero variance, zero signal, just noise. Cut it before it
+# ever gets ranked.
+_EXCLUDED_PROCESS_NAMES = {"System Idle Process", "Idle"}
+
 
 # =====================================================================
-# GPU BACKEND DETECTION — NVIDIA (pynvml) primary, AMD (pyadl) fallback
+# GPU backend — try NVIDIA first (pynvml, official + solid), fall back
+# to AMD (pyadl, unofficial, Windows-only, never tested on real AMD hw)
 # =====================================================================
 _GPU_BACKEND = None
 _NVML_HANDLE = None
@@ -60,42 +71,134 @@ except Exception:
 
 def get_gpu_metrics() -> tuple[float | None, float | None, float | None]:
     """
-    Returns (gpu_percent, gpu_memory_percent, gpu_temp).
-    Never raises — a flaky GPU read must not kill a collection cycle.
+    Three separate try/excepts on purpose — originally had util/mem/temp
+    all in one try block, and one failed call was silently wiping out the
+    other two even when they'd have worked fine. Split them apart, no
+    reason a dead utilization read should also cost me a good temp reading.
     """
     if _GPU_BACKEND == "nvidia":
+        gpu_percent = None
+        mem_percent = None
+        gpu_temp = None
+
         try:
             util = pynvml.nvmlDeviceGetUtilizationRates(_NVML_HANDLE)
-            mem = pynvml.nvmlDeviceGetMemoryInfo(_NVML_HANDLE)
-            temp = pynvml.nvmlDeviceGetTemperature(_NVML_HANDLE, pynvml.NVML_TEMPERATURE_GPU)
-            mem_percent = round((mem.used / mem.total) * 100, 2) if mem.total else None
-            return float(util.gpu), mem_percent, float(temp)
+            gpu_percent = float(util.gpu)
+        except (pynvml.NVMLError_NotSupported, pynvml.NVMLError_Unknown):
+            # GPU sitting in a low-power state (P8) with nothing touching
+            # it — utilization query just refuses to answer. Docs/forums
+            # say this throws NotSupported, but on my actual laptop it's
+            # NVMLError_Unknown ("Unknown Error", code 999) — confirmed
+            # by turning DEBUG logging on and reading collector.log.
+            # Either way it means "idle," so call it 0%, not unknown.
+            gpu_percent = 0.0
         except Exception as e:
-            logger.debug(f"NVIDIA GPU read failed: {e}")
-            return None, None, None
+            logger.debug(f"NVIDIA GPU utilization read failed: {e}")
+
+        try:
+            mem = pynvml.nvmlDeviceGetMemoryInfo(_NVML_HANDLE)
+            mem_percent = round((mem.used / mem.total) * 100, 2) if mem.total else None
+        except Exception as e:
+            logger.debug(f"NVIDIA GPU memory read failed: {e}")
+
+        try:
+            gpu_temp = float(pynvml.nvmlDeviceGetTemperature(_NVML_HANDLE, pynvml.NVML_TEMPERATURE_GPU))
+        except Exception as e:
+            logger.debug(f"NVIDIA GPU temp read failed: {e}")
+
+        return gpu_percent, mem_percent, gpu_temp
 
     elif _GPU_BACKEND == "amd":
+        gpu_percent = None
+        gpu_temp = None
+
+        # pyadl just doesn't have a VRAM call — not "sometimes fails,"
+        # it flat out doesn't exist, so not even trying.
+        mem_percent = None
+
         try:
-            usage = _AMD_DEVICE.getCurrentUsage()
-            temp = _AMD_DEVICE.getCurrentTemperature()
-            # pyadl has no standardized memory-usage call across devices
-            mem_percent = None
-            return float(usage), mem_percent, float(temp)
+            gpu_percent = float(_AMD_DEVICE.getCurrentUsage())
         except Exception as e:
-            logger.debug(f"AMD GPU read failed: {e}")
-            return None, None, None
+            logger.debug(f"AMD GPU usage read failed: {e}")
+
+        try:
+            gpu_temp = float(_AMD_DEVICE.getCurrentTemperature())
+        except Exception as e:
+            logger.debug(f"AMD GPU temp read failed: {e}")
+
+        return gpu_percent, mem_percent, gpu_temp
 
     return None, None, None
 
 
+def _get_gpu_inventory() -> tuple[str, bool]:
+    """
+    Just listing every video controller Windows knows about, not polling
+    anything. Point of this: most laptops are hybrid (Intel iGPU +
+    NVIDIA dGPU), and gpu_percent above only ever reflects the discrete
+    card. Worth knowing whether that's even the case on a given machine.
+    Cheap WMI call, runs once at startup, no admin needed for this one.
+    """
+    try:
+        import wmi
+        w = wmi.WMI()
+        names = [c.Name for c in w.Win32_VideoController() if c.Name]
+        return ", ".join(names), len(names) > 1
+    except Exception as e:
+        logger.debug(f"GPU inventory enumeration failed: {e}")
+        return "unknown", False
+
+
+def collect_system_info(interval_seconds: int) -> dict:
+    """
+    Runs once at collector startup, not per snapshot — CPU model/RAM/GPU
+    list don't change mid-session. Wrapped in a broad try/except because
+    I'd rather start the collector with a half-empty system_info row
+    than have some WMI hiccup block the whole thing from starting.
+    """
+    try:
+        cpu_model = None
+        try:
+            import wmi
+            w = wmi.WMI()
+            cpu_model = w.Win32_Processor()[0].Name.strip()
+        except Exception as e:
+            logger.debug(f"WMI CPU model read failed, falling back: {e}")
+            cpu_model = platform.processor()
+
+        gpu_names, is_hybrid = _get_gpu_inventory()
+
+        return {
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "hostname": socket.gethostname(),
+            "os_name": platform.system(),
+            "os_version": platform.platform(),
+            "cpu_model": cpu_model,
+            "cpu_cores_physical": psutil.cpu_count(logical=False),
+            "cpu_cores_logical": psutil.cpu_count(logical=True),
+            "ram_total_gb": round(psutil.virtual_memory().total / (1024 ** 3), 2),
+            "gpu_backend": _GPU_BACKEND,
+            "gpu_names": gpu_names,
+            "is_hybrid_gpu_system": int(is_hybrid),
+            "python_version": platform.python_version(),
+            "collector_interval_seconds": interval_seconds,
+        }
+    except Exception as e:
+        logger.error(f"Failed to collect system_info: {e}")
+        return {"recorded_at": datetime.now(timezone.utc).isoformat()}
+
+
 def _get_cpu_temp_hardview() -> float | None:
     """
-    Primary CPU temp source: HardView's PyTempCpu (wraps LibreHardwareMonitorLib
-    on Windows). Uses get_avg_temp() specifically — averaged across cores,
-    which behaves as a proper time-series signal (rises/falls with real
-    thermal load) unlike get_max_temp() (ratchets upward, never resets
-    until restart) or get_temp() (single-core snapshot, noisy).
-    Requires Administrator privileges.
+    get_avg_temp() specifically, not get_temp() or get_max_temp() — tried
+    get_temp() first and got a single-core reading of 94°C that spiked
+    around unpredictably. get_max_temp() just ratchets up and never comes
+    back down until restart, useless for a time series. avg across cores
+    actually moves up and down with real load, which is what I want.
+
+    Needs admin rights to read anything real — without elevation this
+    just returns None every time, no error, no warning, just silence.
+    Wasted a while on that before realizing.
     """
     try:
         import HardView
@@ -111,13 +214,10 @@ def _get_cpu_temp_hardview() -> float | None:
 
 def get_cpu_temp() -> float | None:
     """
-    Three-tier CPU temp fallback, best source first:
-      1. HardView (bundles LibreHardwareMonitorLib on Windows / lm-sensors
-         on Linux — no external process to manage, but requires admin)
-      2. Windows ACPI thermal zone via WMI (built-in, OEM-dependent, often fails)
-      3. psutil sensors_temperatures() (Linux only, no-op on Windows)
-    Returns None if all tiers fail — a real hardware/driver limitation,
-    not a bug, and worth documenting rather than chasing further.
+    HardView first, then ACPI/WMI, then psutil (Linux-only, dead code on
+    Windows but costs nothing to leave in). Even with all three, some
+    laptops just never expose CPU temp — that's the OEM's firmware, not
+    something I can fix from Python. Not chasing this further than this.
     """
     temp = _get_cpu_temp_hardview()
     if temp is not None:
@@ -128,6 +228,9 @@ def get_cpu_temp() -> float | None:
             import wmi
             w = wmi.WMI(namespace="root\\wmi")
             thermal_info = w.MSAcpi_ThermalZoneTemperature()[0]
+            # ACPI reports tenths of a Kelvin, not Celsius — tripped
+            # over this the first time, values looked insane until I
+            # did the conversion right.
             temp_celsius = (thermal_info.CurrentTemperature / 10.0) - 273.15
             return round(temp_celsius, 1)
         except Exception as e:
@@ -146,7 +249,6 @@ def get_cpu_temp() -> float | None:
 
 
 def get_disk_usage_percent() -> float | None:
-    """Returns % capacity used on the system drive."""
     try:
         root = os.path.abspath(os.sep)
         return psutil.disk_usage(root).percent
@@ -156,39 +258,42 @@ def get_disk_usage_percent() -> float | None:
 
 
 # =====================================================================
-# RATE CALCULATION — converts psutil's cumulative counters into MB/s
+# disk/net rates — psutil only gives cumulative bytes since boot, which
+# on its own is basically "how long has this machine been on." need the
+# delta between two samples to get anything meaningful.
 # =====================================================================
-_prev_io_sample = None  # {"time", "disk_read", "disk_write", "net_sent", "net_recv"} in bytes
+_prev_io_sample = None
 
 
 def _safe_rate_mb_s(current_bytes, prev_bytes, elapsed_seconds) -> float | None:
     """
-    Computes MB/s between two cumulative byte counts. Returns None if
-    inputs are missing, elapsed time is non-positive/implausible, or the
-    counter appears to have reset (delta negative).
+    time.monotonic() instead of time.time() for elapsed — wall clock can
+    jump (NTP sync, manual change) and would wreck this math. monotonic
+    only ever goes forward.
 
-    The upper bound on elapsed_seconds guards against sleep/suspend edge
-    cases where the monotonic clock's behavior during suspend is platform-
-    dependent — an elapsed window far larger than the collector's own
-    interval means a real-world gap (sleep, missed cycles) occurred, and
-    computing a rate across it would be misleading, not informative.
+    The 300s cap exists because of laptop sleep — if the machine was
+    suspended for hours between two snapshots, dividing the accumulated
+    bytes by that huge elapsed window gives a rate that looks tiny/wrong,
+    not "no data." Better to just say None and let the gap show up as a
+    gap, not a fake reading.
     """
     if current_bytes is None or prev_bytes is None or elapsed_seconds <= 0:
         return None
-    if elapsed_seconds > 300:  # >5x a typical 30-60s interval = treat as a gap, not a rate
+    if elapsed_seconds > 300:
         return None
     delta_bytes = current_bytes - prev_bytes
     if delta_bytes < 0:
+        # network interface reset or similar — counter went backwards,
+        # can't trust it
         return None
     return round((delta_bytes / (1024 ** 2)) / elapsed_seconds, 4)
 
 
 def get_io_rates(disk_io, net_io) -> dict:
     """
-    Converts cumulative disk/network counters into per-second rates by
-    comparing against the previous snapshot's readings. First call ever
-    (no previous sample) returns None for all four — expected and fine,
-    that row just has no rate data yet.
+    First call ever has nothing to diff against — all four come back
+    None on row 1 of every session. Expected, not a bug, don't panic
+    when you see it in the DB.
     """
     global _prev_io_sample
     now = time.monotonic()
@@ -220,7 +325,13 @@ def get_io_rates(disk_io, net_io) -> dict:
 
 
 def _prime_process_cpu_percent():
-    """Primes psutil's per-process CPU delta tracking."""
+    """
+    proc.cpu_percent() needs two calls to mean anything — first call is
+    always garbage/zero because there's no prior sample yet. This is the
+    "throwaway" first call; the real read happens later in
+    get_top_processes(), after the 1s window from cpu_percent(interval=1)
+    has actually passed.
+    """
     for proc in psutil.process_iter():
         try:
             proc.cpu_percent(interval=None)
@@ -229,17 +340,23 @@ def _prime_process_cpu_percent():
 
 
 def get_top_processes(n: int = TOP_N_PROCESSES) -> dict:
-    """Returns top N processes by CPU% and top N by RAM%, flattened."""
+    """
+    Order matters here — this has to run after cpu_percent(interval=1)
+    in collect_once(), not before, or the per-process deltas are still
+    zero. Learned that the hard way with a whole run of null process data.
+    """
     processes = []
     for proc in psutil.process_iter(attrs=["pid", "name"]):
         try:
             name = proc.info.get("name") or "unknown"
             if name in _EXCLUDED_PROCESS_NAMES:
-                continue  # not a real workload — skip so it never occupies a top slot
+                continue
             cpu_pct = proc.cpu_percent(interval=None)
             ram_pct = proc.memory_percent()
             processes.append({"name": name, "cpu": cpu_pct, "ram": ram_pct})
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            # process can vanish between listing it and reading it —
+            # totally normal, not worth logging every time
             continue
 
     result = {}
@@ -265,9 +382,11 @@ def get_top_processes(n: int = TOP_N_PROCESSES) -> dict:
 
 
 def collect_once() -> dict:
-    """Takes a single snapshot of system + process metrics."""
+    """One full snapshot. Called every interval_seconds from run_collector()."""
     _prime_process_cpu_percent()
 
+    # this blocks for 1s — doing double duty as both the system-wide CPU
+    # sample window AND the wait needed for per-process deltas to be real
     cpu = psutil.cpu_percent(interval=1)
     ram = psutil.virtual_memory().percent
     disk_io = psutil.disk_io_counters()
@@ -299,7 +418,11 @@ def collect_once() -> dict:
 
 
 def collect_with_retry(max_retries: int = 3, backoff_seconds: float = 2.0) -> dict | None:
-    """Wraps collect_once() with retry + linear backoff for transient failures."""
+    """
+    Backing off instead of hammering retries immediately — if something's
+    momentarily busy, retrying instantly just hits the same wall again.
+    Give it a second to sort itself out.
+    """
     for attempt in range(1, max_retries + 1):
         try:
             return collect_once()
@@ -312,8 +435,22 @@ def collect_with_retry(max_retries: int = 3, backoff_seconds: float = 2.0) -> di
 
 
 def run_collector(interval_seconds: int = 30):
-    """Main loop. Individual failures are logged/skipped; 5 consecutive stops it."""
+    """
+    Main loop. One bad cycle shouldn't kill a multi-day run — only bail
+    out after 5 in a row, since that's a real problem (disk full, DB
+    gone, etc.) and not just a one-off hiccup.
+    """
     init_db()
+
+    system_info = collect_system_info(interval_seconds)
+    insert_system_info(system_info)
+    logger.info(
+        f"System: {system_info.get('hostname')} | "
+        f"CPU: {system_info.get('cpu_model')} | "
+        f"GPUs: {system_info.get('gpu_names')} | "
+        f"Hybrid: {bool(system_info.get('is_hybrid_gpu_system'))}"
+    )
+
     logger.info(f"Collector started (interval={interval_seconds}s, GPU backend={_GPU_BACKEND}). Ctrl+C to stop.")
     consecutive_failures = 0
 
@@ -340,6 +477,8 @@ def run_collector(interval_seconds: int = 30):
                     f"DiskR={record['disk_read_mb_s']}MB/s NetSent={record['net_sent_mb_s']}MB/s"
                 )
             except Exception as e:
+                # data's already collected, just failed to save it —
+                # log the whole record so it's not totally lost
                 logger.error(f"DB write failed, snapshot lost: {e} | Record was: {record}")
 
             time.sleep(interval_seconds)
