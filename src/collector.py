@@ -9,6 +9,7 @@ import time
 import platform
 import socket
 import logging
+import requests
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from datetime import datetime, timezone
@@ -24,7 +25,7 @@ LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
 logger = logging.getLogger("driftwatch.collector")
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 _console_handler = logging.StreamHandler()
 _file_handler = RotatingFileHandler(LOG_DIR / "collector.log", maxBytes=5_000_000, backupCount=3)
@@ -188,38 +189,63 @@ def collect_system_info(interval_seconds: int) -> dict:
         return {"recorded_at": datetime.now(timezone.utc).isoformat()}
 
 
-def _get_cpu_temp_hardview() -> float | None:
-    """
-    get_avg_temp() specifically, not get_temp() or get_max_temp() — tried
-    get_temp() first and got a single-core reading of 94°C that spiked
-    around unpredictably. get_max_temp() just ratchets up and never comes
-    back down until restart, useless for a time series. avg across cores
-    actually moves up and down with real load, which is what I want.
 
-    Needs admin rights to read anything real — without elevation this
-    just returns None every time, no error, no warning, just silence.
-    Wasted a while on that before realizing.
+def _get_cpu_temp_lhm_webserver() -> float | None:
+    """
+    Uses LibreHardwareMonitor's built-in Remote Web Server (Options ->
+    Remote Web Server -> Run, default port 8085) instead of WMI.
+
+    Switched to this after confirming a real regression: LHM's latest
+    release reads sensors fine (PawnIO works, temps show correctly in
+    its own UI) but stopped publishing WMI entirely — confirmed via a
+    matching GitHub issue, not something specific to this machine.
+    Downgrading to get WMI back (v0.9.4) broke sensor reading instead,
+    since that version predates PawnIO and still expects the old,
+    now-removed WinRing0 driver. The web server sidesteps this
+    conflict — it's part of the same app process that already reads
+    sensors correctly, no separate publishing mechanism to break.
     """
     try:
-        import HardView
-        temp_cpu = HardView.PyTempCpu()
-        temp_cpu.update()
-        temp = temp_cpu.get_avg_temp()
-        if temp is not None:
-            return round(float(temp), 1)
+        import requests
+        resp = requests.get("http://localhost:8085/data.json", timeout=2)
+        resp.raise_for_status()
+        data = resp.json()
+
+        def find_cpu_package_temp(node):
+            if node.get("Text", "").startswith("CPU Package") and "°C" in str(node.get("Value", "")):
+                try:
+                    return float(node["Value"].replace("°C", "").strip())
+                except (ValueError, KeyError):
+                    return None
+            for child in node.get("Children", []):
+                result = find_cpu_package_temp(child)
+                if result is not None:
+                    return result
+            return None
+
+        temp = find_cpu_package_temp(data)
+        return round(temp, 1) if temp is not None else None
+
     except Exception as e:
-        logger.debug(f"HardView CPU temp read failed: {e}")
-    return None
+        logger.debug(f"LibreHardwareMonitor web server read failed (is it running?): {e}")
+        return None
 
 
 def get_cpu_temp() -> float | None:
     """
-    HardView first, then ACPI/WMI, then psutil (Linux-only, dead code on
-    Windows but costs nothing to leave in). Even with all three, some
-    laptops just never expose CPU temp — that's the OEM's firmware, not
-    something I can fix from Python. Not chasing this further than this.
+    Three-tier fallback, best source first:
+      1. LibreHardwareMonitor's local web server (localhost:8085) —
+         requires the app running with Remote Web Server enabled.
+         Chosen over WMI after confirming WMI publishing is broken in
+         the current LHM release (documented upstream regression).
+      2. Windows ACPI thermal zone via WMI — built-in, no extra app,
+         but OEM-dependent and fails on a lot of consumer laptops.
+      3. psutil sensors_temperatures() — Linux only, harmless no-op
+         on Windows, kept for portability.
+    Returns None if all three fail — a real hardware/software
+    limitation at that point, not a bug worth chasing further.
     """
-    temp = _get_cpu_temp_hardview()
+    temp = _get_cpu_temp_lhm_webserver()
     if temp is not None:
         return temp
 
@@ -228,9 +254,6 @@ def get_cpu_temp() -> float | None:
             import wmi
             w = wmi.WMI(namespace="root\\wmi")
             thermal_info = w.MSAcpi_ThermalZoneTemperature()[0]
-            # ACPI reports tenths of a Kelvin, not Celsius — tripped
-            # over this the first time, values looked insane until I
-            # did the conversion right.
             temp_celsius = (thermal_info.CurrentTemperature / 10.0) - 273.15
             return round(temp_celsius, 1)
         except Exception as e:

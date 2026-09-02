@@ -188,23 +188,38 @@ def insert_metric(record: dict):
 
 
 def insert_system_info(record: dict):
-    """One call per collector startup — see collect_system_info() in collector.py."""
-    cols = [
-        "recorded_at", "hostname", "os_name", "os_version", "cpu_model",
-        "cpu_cores_physical", "cpu_cores_logical", "ram_total_gb",
-        "gpu_backend", "gpu_names", "is_hybrid_gpu_system",
-        "python_version", "collector_interval_seconds",
-    ]
-    safe_record = dict(record)
-    for col in cols:
-        safe_record.setdefault(col, None)
-
-    placeholders = [f":{c}" for c in cols]
-    query = f"""
-        INSERT INTO system_info ({", ".join(cols)})
-        VALUES ({", ".join(placeholders)})
     """
+    Only inserts a new row if it differs from the most recent one
+    (ignoring recorded_at/collector_interval_seconds, which change
+    trivially on every restart without reflecting anything meaningful).
+    Otherwise you get one row per debugging restart, which is just
+    noise — a hardware/OS snapshot only needs a new row when the
+    hardware/OS picture actually changes.
+    """
+    compare_cols = ["hostname", "os_version", "cpu_model", "ram_total_gb",
+                     "gpu_backend", "gpu_names", "is_hybrid_gpu_system"]
+
     with get_connection() as conn:
+        conn.row_factory = sqlite3.Row
+        last = conn.execute(
+            "SELECT * FROM system_info ORDER BY recorded_at DESC LIMIT 1"
+        ).fetchone()
+
+        if last and all(last[c] == record.get(c) for c in compare_cols):
+            return  # nothing meaningful changed, skip the insert
+
+        cols = [
+            "recorded_at", "hostname", "os_name", "os_version", "cpu_model",
+            "cpu_cores_physical", "cpu_cores_logical", "ram_total_gb",
+            "gpu_backend", "gpu_names", "is_hybrid_gpu_system",
+            "python_version", "collector_interval_seconds",
+        ]
+        safe_record = dict(record)
+        for col in cols:
+            safe_record.setdefault(col, None)
+
+        placeholders = [f":{c}" for c in cols]
+        query = f"INSERT INTO system_info ({', '.join(cols)}) VALUES ({', '.join(placeholders)})"
         conn.execute(query, safe_record)
         conn.commit()
 
