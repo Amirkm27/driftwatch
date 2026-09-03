@@ -11,17 +11,22 @@ import socket
 import logging
 import requests
 from logging.handlers import RotatingFileHandler
-from pathlib import Path
 from datetime import datetime, timezone
 
 import psutil
 
-from src.database import init_db, insert_metric, insert_system_info, TOP_N_PROCESSES
+from src.config import (
+    LOG_DIR,
+    TOP_N_PROCESSES,
+    DEFAULT_INTERVAL_SECONDS,
+    LHM_WEB_SERVER_URL,
+    EXCLUDED_PROCESS_NAMES,
+)
+from src.database import init_db, insert_metric, insert_system_info
 
 # --- logging: console + rotating file. leaving at DEBUG for now while
 # I'm still chasing the GPU null issue — bump back to INFO once that's
 # actually confirmed fixed, DEBUG is way too noisy for a week-long run ---
-LOG_DIR = Path(__file__).resolve().parent.parent / "logs"
 LOG_DIR.mkdir(exist_ok=True)
 
 logger = logging.getLogger("driftwatch.collector")
@@ -36,13 +41,6 @@ _file_handler.setFormatter(_formatter)
 if not logger.handlers:
     logger.addHandler(_console_handler)
     logger.addHandler(_file_handler)
-
-# "System Idle Process" reports something like 1400%+ CPU on a multicore
-# box (psutil quirk, not normalized) and camps in the #1 slot every single
-# snapshot — zero variance, zero signal, just noise. Cut it before it
-# ever gets ranked.
-_EXCLUDED_PROCESS_NAMES = {"System Idle Process", "Idle"}
-
 
 # =====================================================================
 # GPU backend — try NVIDIA first (pynvml, official + solid), fall back
@@ -207,7 +205,7 @@ def _get_cpu_temp_lhm_webserver() -> float | None:
     """
     try:
         import requests
-        resp = requests.get("http://localhost:8085/data.json", timeout=2)
+        resp = requests.get(LHM_WEB_SERVER_URL, timeout=2)
         resp.raise_for_status()
         data = resp.json()
 
@@ -372,7 +370,7 @@ def get_top_processes(n: int = TOP_N_PROCESSES) -> dict:
     for proc in psutil.process_iter(attrs=["pid", "name"]):
         try:
             name = proc.info.get("name") or "unknown"
-            if name in _EXCLUDED_PROCESS_NAMES:
+            if name in EXCLUDED_PROCESS_NAMES:
                 continue
             cpu_pct = proc.cpu_percent(interval=None)
             ram_pct = proc.memory_percent()
@@ -457,7 +455,7 @@ def collect_with_retry(max_retries: int = 3, backoff_seconds: float = 2.0) -> di
     return None
 
 
-def run_collector(interval_seconds: int = 30):
+def run_collector(interval_seconds: int = DEFAULT_INTERVAL_SECONDS):
     """
     Main loop. One bad cycle shouldn't kill a multi-day run — only bail
     out after 5 in a row, since that's a real problem (disk full, DB
@@ -514,4 +512,4 @@ def run_collector(interval_seconds: int = 30):
 
 
 if __name__ == "__main__":
-    run_collector(interval_seconds=30)
+    run_collector(interval_seconds=DEFAULT_INTERVAL_SECONDS)

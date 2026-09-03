@@ -5,12 +5,9 @@ SQLite layer for DriftWatch. Two tables:
   don't change between snapshots, so no point repeating them 1000s of times
 """
 import sqlite3
-from pathlib import Path
 from contextlib import contextmanager
 
-DB_PATH = Path(__file__).resolve().parent.parent / "data" / "driftwatch.db"
-
-TOP_N_PROCESSES = 3
+from src.config import DB_PATH, TOP_N_PROCESSES
 
 
 def init_db():
