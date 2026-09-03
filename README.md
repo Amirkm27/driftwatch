@@ -73,7 +73,7 @@ release — see Known Limitations).
 src/
   collector.py — metric collection loop (psutil, GPU, temp sensors)
   database.py — SQLite schema and data access
-  config.py — shared constants (planned — not yet split out)
+  config.py — shared constants (DB_PATH, LOG_DIR, TOP_N_PROCESSES, interval, LHM URL, excluded processes)
 data/ — local telemetry database (gitignored)
 logs/ — rotating collector logs (gitignored)
 notebooks/ — EDA and analysis notebooks
