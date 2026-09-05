@@ -30,3 +30,15 @@ LHM_WEB_SERVER_URL = "http://localhost:8085/data.json"
 # quirk, not normalized) and camps in the #1 slot every snapshot — zero
 # variance, zero signal. Cut before ranking, not after.
 EXCLUDED_PROCESS_NAMES = {"System Idle Process", "Idle"}
+
+# --- Analysis pipeline ---------------------------------------------------
+# Numeric metric columns used by features.py / detectors.py. Kept here so
+# adding a raw metric to the metrics table schema (database.py) and to the
+# analysis pipeline only requires touching one list, not three.
+NUMERIC_METRICS = [
+    "cpu_percent", "cpu_temp", "ram_percent",
+    "disk_read_mb_s", "disk_write_mb_s", "disk_usage_percent",
+    "net_sent_mb_s", "net_recv_mb_s",
+    "battery_percent",
+    "gpu_percent", "gpu_memory_percent", "gpu_temp",
+]

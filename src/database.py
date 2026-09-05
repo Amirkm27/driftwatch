@@ -53,6 +53,7 @@ def init_db():
 
         _ensure_process_columns(conn)
         _create_system_info_table(conn)
+        _ensure_system_info_fk_column(conn)
 
 
 def _ensure_process_columns(conn: sqlite3.Connection):
@@ -74,6 +75,24 @@ def _ensure_process_columns(conn: sqlite3.Connection):
     for col_name, col_type in new_columns:
         if col_name not in existing_cols:
             conn.execute(f"ALTER TABLE metrics ADD COLUMN {col_name} {col_type}")
+    conn.commit()
+
+
+def _ensure_system_info_fk_column(conn: sqlite3.Connection):
+    """
+    Links each metrics row to the system_info snapshot that was active
+    when it was collected. Matters once there's more than one machine in
+    the data — without this, GPU columns from an NVIDIA laptop and an
+    AMD desktop are indistinguishable in the raw table. Existing rows
+    from before this column existed are left NULL here; a one-time
+    backfill script handles those since it can't be done safely without
+    knowing which machine actually produced them.
+    """
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(metrics)")}
+    if "system_info_id" not in existing_cols:
+        conn.execute(
+            "ALTER TABLE metrics ADD COLUMN system_info_id INTEGER REFERENCES system_info (id)"
+        )
     conn.commit()
 
 
@@ -140,6 +159,12 @@ def _build_process_columns_and_placeholders():
     return cols, placeholders
 
 
+def _get_current_system_info_id(conn: sqlite3.Connection):
+    """Most recent system_info row — assumed to describe whatever machine is running right now."""
+    row = conn.execute("SELECT id FROM system_info ORDER BY recorded_at DESC LIMIT 1").fetchone()
+    return row[0] if row else None
+
+
 def insert_metric(record: dict):
     """
     setdefault(None) on every process column because some snapshots
@@ -162,6 +187,7 @@ def insert_metric(record: dict):
         "net_sent_mb_s", "net_recv_mb_s",
         "battery_percent", "battery_plugged",
         "gpu_percent", "gpu_memory_percent", "gpu_temp",
+        "system_info_id",
     ] + process_cols
 
     all_placeholders = [
@@ -172,6 +198,7 @@ def insert_metric(record: dict):
         ":net_sent_mb_s", ":net_recv_mb_s",
         ":battery_percent", ":battery_plugged",
         ":gpu_percent", ":gpu_memory_percent", ":gpu_temp",
+        ":system_info_id",
     ] + process_placeholders
 
     query = f"""
@@ -180,6 +207,7 @@ def insert_metric(record: dict):
     """
 
     with get_connection() as conn:
+        safe_record["system_info_id"] = _get_current_system_info_id(conn)
         conn.execute(query, safe_record)
         conn.commit()
 
