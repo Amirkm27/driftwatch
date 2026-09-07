@@ -1,9 +1,13 @@
 # DriftWatch
 
-Continuous system telemetry logging with ML-based anomaly detection —
-z-score baseline, Isolation Forest, and CUSUM — for spotting abnormal
-performance or health patterns on personal hardware, running across
-both a Windows laptop (NVIDIA GPU) and a Windows desktop (AMD).
+Continuous system telemetry logging with ML-based anomaly detection for
+spotting abnormal performance or health patterns on personal hardware,
+running across both a Windows laptop (NVIDIA GPU) and a Windows desktop
+(AMD).
+
+**Currently implemented:** z-score and Mahalanobis distance baseline
+detectors, evaluated against both real confirmed events and synthetically
+injected anomalies. **Planned (Week 3):** Isolation Forest and CUSUM.
 
 ## What It Does
 
@@ -19,16 +23,18 @@ it to a local SQLite database:
   once per collector session — and only re-recorded if it actually
   changes, so restarting the collector doesn't spam duplicate rows
 
-The goal is a labeled, ground-truth dataset of "normal" system behavior
-across a wide range of real states — idle, everyday use, heavy CPU load,
-heavy GPU load, mixed workloads — used later to train and evaluate
-anomaly detectors against both synthetic and naturally occurring events.
+That raw telemetry then feeds an analysis pipeline: rolling-window
+feature engineering, two anomaly detectors (with more planned), and an
+evaluation harness that scores each detector against both hand-confirmed
+real events (stress tests, gaming sessions) and synthetically injected
+anomalies with known ground truth.
 
 ## Stack
 
 Python 3.14 · psutil · pynvml/pyadl (GPU) · LibreHardwareMonitor Remote
-Web Server (CPU temp, polled via `requests`) · SQLite · pandas ·
-scikit-learn · matplotlib
+Web Server (CPU temp, polled via `requests`) · SQLite · pandas · numpy ·
+scipy (Mahalanobis / chi-square) · scikit-learn (evaluation metrics,
+planned Isolation Forest) · matplotlib
 
 ## Setup
 
@@ -71,10 +77,23 @@ release — see Known Limitations).
 ## Project Structure
 ```
 src/
-  collector.py — metric collection loop (psutil, GPU, temp sensors)
-  database.py — SQLite schema and data access
-  config.py — shared constants (DB_PATH, LOG_DIR, TOP_N_PROCESSES, interval, LHM URL, excluded processes)
-data/ — local telemetry database (gitignored)
+  collector.py             — metric collection loop (psutil, GPU, temp sensors)
+  database.py               — metrics/system_info schema and data access
+  config.py                 — shared constants (paths, metric list, collection settings)
+  db_schema.py               — analysis schema (features/labels/detections/etc.)
+  migrate_db.py              — applies/updates the analysis schema, imports labels.csv
+  features.py                — rolling-window feature engineering
+  detectors.py                — z-score and Mahalanobis distance detectors
+  build_label_bridge.py       — resolves label time-windows into row-level links
+  check_label_overlap.py      — informal per-label flag-rate check
+  evaluate.py                  — formal precision/recall/F1/ROC-AUC evaluation
+  inject_anomalies.py          — builds a synthetic evaluation dataset with known-location anomalies
+  find_gaming_sessions.py      — utility for identifying gaming sessions to label
+data/
+  driftwatch.db              — real telemetry + analysis results (gitignored)
+  driftwatch_synthetic.db     — synthetic evaluation dataset (gitignored)
+  labels.csv                  — hand-confirmed real event labels (gitignored — personal usage data)
+  evaluation_results.csv       — running log of every evaluation run (tracked)
 logs/ — rotating collector logs (gitignored)
 notebooks/ — EDA and analysis notebooks
 tests/ — test suite (planned)
@@ -82,9 +101,80 @@ tests/ — test suite (planned)
 
 ## Database Schema
 
-Two tables:
-- **`metrics`** — one row per snapshot (~every 30s): vitals, GPU, disk/network rates, top processes
-- **`system_info`** — one row per collector session: static hardware/OS facts (CPU model, RAM, detected GPUs, hybrid-GPU flag). Used to tell which machine a dataset came from when combining laptop + desktop data during analysis. A new row is only inserted when hostname, OS version, CPU model, RAM, or GPU info actually changes — not on every restart.
+Normalized across seven tables, redesigned in Week 2 after an initial
+denormalized version bloated to ~3.6MB from duplicated raw values stored
+in every derived table — the current schema cut that by roughly 90% and
+added real foreign-key constraints throughout:
+
+- **`metrics`** — one row per snapshot (~every 30s): vitals, GPU,
+  disk/network rates, top processes. Append-only, single source of
+  truth, never derived from anything else.
+- **`system_info`** — one row per distinct hardware/OS configuration.
+  Only writes a new row when hardware actually changes. `metrics`
+  carries a `system_info_id` foreign key back to this table, so combined
+  laptop + desktop datasets can be told apart later.
+- **`features`** — one row per `metrics` row: rolling mean/std/median/MAD
+  and first-difference per metric. No raw metric values duplicated —
+  join back to `metrics` via `metrics_id` when needed.
+- **`labels`** — confirmed anomaly/event time windows (`start_ts`,
+  `end_ts`, `label`, `source`, `confidence`), both real
+  (`ram_spike`, `cpu_stress`, `gaming_gpu_load`) and synthetic.
+- **`label_metrics`** — bridge table materializing exactly which
+  `metrics` rows fall inside each label's time window, so evaluation
+  queries are clean joins instead of `BETWEEN` scans.
+- **`detection_runs`** — one row per detector execution (method,
+  threshold, timestamp). Re-running a detector replaces its previous
+  run rather than accumulating history.
+- **`detections`** — one row per (metrics × run): score and anomaly
+  flag. References `detection_runs` for method/threshold context
+  instead of repeating it on every row.
+
+## Analysis Pipeline
+
+Run in this order whenever there's new data:
+
+```bash
+python -m src.migrate_db          # ensure schema is current
+python -m src.features            # compute rolling features for new rows
+python -m src.detectors           # run z-score + Mahalanobis
+python -m src.build_label_bridge  # resolve any new/changed labels
+python -m src.evaluate --save     # precision/recall/F1/ROC-AUC, logged to CSV
+```
+
+All five scripts accept `--db <path>` to target a different database —
+used to run the identical pipeline against the synthetic evaluation
+dataset without touching real data:
+
+```bash
+python -m src.inject_anomalies                              # builds driftwatch_synthetic.db
+python -m src.features --db data\driftwatch_synthetic.db
+python -m src.detectors --db data\driftwatch_synthetic.db
+python -m src.build_label_bridge --db data\driftwatch_synthetic.db
+python -m src.evaluate --db data\driftwatch_synthetic.db --save
+```
+
+## Detection Methods
+
+- **Z-score (baseline)** — robust per-metric z-score using rolling
+  median/MAD rather than mean/std, with a global-std floor to prevent
+  runaway values on metrics that sit at zero most of the time (disk/net
+  rates). Reduced to a composite score per row (max absolute z-score
+  across metrics).
+- **Mahalanobis distance** — multivariate distance against a
+  mean/covariance fit on data *not* covered by any label, so known
+  anomalies don't get baked into the "normal" model. Threshold set via
+  the chi-square distribution at the target confidence level.
+
+## Evaluation
+
+Two parallel ground-truth sources: hand-confirmed real events in
+`labels.csv` (stress tests, memory spikes, gaming sessions — the latter
+a deliberate negative-class case, since it's legitimate heavy load that
+should *not* be flagged), and a synthetic dataset (`inject_anomalies.py`)
+with CPU spikes, memory leaks, and disk thrash injected at known,
+labeled locations. `evaluate.py` computes precision, recall, F1, and
+ROC-AUC for each detector against both, logged to
+`data/evaluation_results.csv`.
 
 ## GPU Support
 
@@ -98,6 +188,11 @@ Two tables:
 
 ## Known Limitations
 
+- **Ground truth treats unlabeled data as normal.** Evaluation assumes
+  any `metrics` row not covered by a label is a true negative — real
+  anomalies that were never manually confirmed would be silently
+  scored as correct rejections. Mitigated but not eliminated by the
+  synthetic dataset, which has exhaustive known-location labels.
 - **Integrated GPU utilization is not tracked.** Most laptops are hybrid
   (an integrated GPU alongside a discrete one), routing everyday work
   to the integrated chip while the discrete GPU idles — so `gpu_percent`
@@ -124,13 +219,19 @@ Two tables:
   it — so a mixed-interval dataset won't be self-documenting from that
   table alone. Worth checking snapshot-to-snapshot gaps directly in
   `metrics.timestamp` if this matters for a given analysis.
-- **AMD GPU path is unverified** — see above.
+- **AMD GPU path is unverified** — see above. `system_info_id` groundwork
+  is in place for combining laptop + desktop data, but no desktop data
+  has been collected or merged yet.
 
 ## Future Work (Out of Scope for Now)
 
+- Isolation Forest and CUSUM detectors (Week 3)
+- Streamlit dashboard, lightweight feature importance (Week 4)
 - Integrated GPU utilization tracking (via Windows performance counters)
 - Adaptive drift thresholding (e.g. ADWIN) instead of a fixed baseline
 - Distribution-shift detection (e.g. MMD) as an alternative to CUSUM
 - Real-time alerting/notification, rather than post-hoc analysis
-- Cross-machine dataset merging into a unified schema/store instead of
-  two separate local SQLite files
+- Merging the Ryzen 5 desktop's independently-collected data into the
+  laptop's database (schema supports it via `system_info_id`; the actual
+  merge script, which needs to handle ID-collision remapping between two
+  independently auto-incremented databases, hasn't been written)
