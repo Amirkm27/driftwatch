@@ -118,18 +118,45 @@ def run_zscore_detector(db_path: Path = DB_PATH, threshold: float = Z_THRESHOLD)
 # Mahalanobis detector
 # ---------------------------------------------------------------------------
 
-def compute_mahalanobis(df: pd.DataFrame, cols: list, regularization: float = COV_REGULARIZATION):
+def get_labeled_metrics_ids(db_path: Path) -> set:
     """
-    Squared Mahalanobis distance against the dataset's own mean vector
-    and covariance matrix. Fit on whatever data is passed in, so if
-    you're evaluating against injected anomalies later, fit this on a
-    clean split first rather than the full mixed dataset.
+    Every metrics_id already covered by a label (real or synthetic), via
+    the label_metrics bridge. Used to exclude known-anomalous rows from
+    the Mahalanobis "normal" fit — otherwise the anomalies themselves get
+    baked into the mean/covariance, which is exactly backwards.
+    """
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.execute("SELECT DISTINCT metrics_id FROM label_metrics")
+        return {row[0] for row in cur.fetchall()}
+    except sqlite3.OperationalError:
+        return set()
+    finally:
+        conn.close()
+
+
+def compute_mahalanobis(df: pd.DataFrame, cols: list, fit_mask: pd.Series,
+                         regularization: float = COV_REGULARIZATION):
+    """
+    Squared Mahalanobis distance for every row, but the mean vector and
+    covariance matrix are fit ONLY on rows where fit_mask is True — the
+    known-clean subset. Fitting on the full mixed dataset (clean +
+    anomalies) lets anomalies pull the mean/covariance toward themselves,
+    which mutes exactly the deviations you're trying to detect. Scoring
+    still happens for every row, clean or not, against this fixed fit.
     """
     available_cols = [c for c in cols if c in df.columns]
     data = df[available_cols].copy()
 
     complete_mask = data.notna().all(axis=1)
-    fit_data = data[complete_mask].to_numpy()
+    fit_rows_mask = complete_mask & fit_mask.reindex(df.index, fill_value=False)
+    fit_data = data[fit_rows_mask].to_numpy()
+
+    if len(fit_data) < len(available_cols) + 1:
+        raise ValueError(
+            f"not enough clean rows to estimate a stable covariance matrix, "
+            f"got {len(fit_data)} clean rows for {len(available_cols)} features"
+        )
 
     mean_vec = fit_data.mean(axis=0)
     cov = np.cov(fit_data, rowvar=False)
@@ -145,7 +172,13 @@ def compute_mahalanobis(df: pd.DataFrame, cols: list, regularization: float = CO
 
 def run_mahalanobis_detector(db_path: Path = DB_PATH, confidence: float = MAHALANOBIS_CONFIDENCE) -> None:
     df = load_joined_data(db_path)
-    dist_sq, n_features = compute_mahalanobis(df, NUMERIC_METRICS)
+
+    labeled_ids = get_labeled_metrics_ids(db_path)
+    fit_mask = ~df["metrics_id"].isin(labeled_ids)
+    print(f"fitting on {fit_mask.sum()}/{len(df)} rows not covered by any label "
+          f"({len(labeled_ids)} labeled rows excluded from fit)")
+
+    dist_sq, n_features = compute_mahalanobis(df, NUMERIC_METRICS, fit_mask)
     threshold = chi2.ppf(confidence, df=n_features)
     is_anomaly = dist_sq > threshold
 
@@ -171,5 +204,14 @@ def run_mahalanobis_detector(db_path: Path = DB_PATH, confidence: float = MAHALA
 
 
 if __name__ == "__main__":
-    run_zscore_detector()
-    run_mahalanobis_detector()
+    import argparse
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description="Run z-score and Mahalanobis detectors")
+    parser.add_argument("--db", type=Path, default=None,
+                         help="Path to target database (defaults to config.DB_PATH)")
+    args = parser.parse_args()
+    db_path = args.db or DB_PATH
+
+    run_zscore_detector(db_path=db_path)
+    run_mahalanobis_detector(db_path=db_path)

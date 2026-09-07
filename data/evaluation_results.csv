@@ -1,0 +1,5 @@
+method,tp,fp,tn,fn,precision,recall,f1,roc_auc,n_rows,n_true_anomalies,db_path,computed_at
+zscore,27,430,968,21,0.059080963,0.5625,0.10693069306930693,0.6808536003814973,1446,48,C:\Users\amirk\PycharmProjects\DriftWatch\data\driftwatch.db,2026-09-07T11:33:05.067153+00:00
+mahalanobis,47,141,1238,0,0.25,1,0.4,0.9365713668554148,1426,47,C:\Users\amirk\PycharmProjects\DriftWatch\data\driftwatch.db,2026-09-07T11:33:05.067153+00:00
+zscore,181,366,845,62,0.33089579524680074,0.7448559670781894,0.4582278481012658,0.7803094405534997,1454,243,C:\Users\amirk\PycharmProjects\DriftWatch\data\driftwatch_synthetic.db,2026-09-07T11:44:12.024079+00:00
+mahalanobis,119,100,1090,117,0.54337899543379,0.5042372881355932,0.5230769230769231,0.8532474006551773,1426,236,C:\Users\amirk\PycharmProjects\DriftWatch\data\driftwatch_synthetic.db,2026-09-07T11:44:12.024079+00:00

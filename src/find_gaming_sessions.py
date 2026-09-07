@@ -14,7 +14,7 @@ SESSION_MERGE_GAP_SECONDS = 300   # clusters within this gap get merged into one
                                    # and the process briefly isn't top of any list)
 MIN_SESSION_SECONDS = 60     # drop short blips that aren't real sessions
 MIN_SUSTAINED_ROWS = 3       # cluster must contain at least this many high-gpu rows to count as real
-PROCESS_KEYWORD = "rainbow"  # case-insensitive match against top process columns
+PROCESS_KEYWORD_DEFAULT = "rainbow"  # case-insensitive
 
 
 def load_raw_metrics(db_path: str = DB_PATH) -> pd.DataFrame:
@@ -41,9 +41,9 @@ def matches_process(row, keyword: str) -> bool:
     return False
 
 
-def find_gaming_sessions(df: pd.DataFrame) -> pd.DataFrame:
+def find_gaming_sessions(df: pd.DataFrame, process_keyword: str = PROCESS_KEYWORD_DEFAULT) -> pd.DataFrame:
     sustained_mask = df["gpu_percent"].between(GPU_SUSTAINED_MIN, GPU_SUSTAINED_MAX)
-    process_mask = df.apply(lambda r: matches_process(r, PROCESS_KEYWORD), axis=1)
+    process_mask = df.apply(lambda r: matches_process(r, process_keyword), axis=1)
     launch_mask = df["gpu_percent"] >= GPU_LAUNCH_MIN
 
     # candidate rows are anything that could plausibly be part of a gaming
@@ -125,13 +125,16 @@ def find_gaming_sessions(df: pd.DataFrame) -> pd.DataFrame:
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Find gaming sessions by sustained GPU load + process name")
+    parser.add_argument("--process", type=str, default=PROCESS_KEYWORD_DEFAULT,
+                         help=f"Case-insensitive process name substring to match (default: {PROCESS_KEYWORD_DEFAULT})")
+    args = parser.parse_args()
+
     df = load_raw_metrics()
-    sessions = find_gaming_sessions(df)
+    sessions = find_gaming_sessions(df, process_keyword=args.process)
     if sessions.empty:
         print("no gaming sessions found matching criteria")
     else:
         print(sessions.to_string(index=False))
-
-
-window = df[(df["timestamp"] >= "2026-09-02T19:47:00") & (df["timestamp"] <= "2026-09-02T19:53:00")]
-print(window[["timestamp", "gpu_percent", "cpu_percent", "top_cpu_1_name", "top_ram_1_name"]].to_string())

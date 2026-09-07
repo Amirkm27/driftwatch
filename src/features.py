@@ -84,4 +84,11 @@ def build_features(db_path: Path = DB_PATH) -> int:
 
 
 if __name__ == "__main__":
-    build_features()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Build/update the features table")
+    parser.add_argument("--db", type=Path, default=None,
+                         help="Path to target database (defaults to config.DB_PATH)")
+    args = parser.parse_args()
+
+    build_features(db_path=args.db or DB_PATH)

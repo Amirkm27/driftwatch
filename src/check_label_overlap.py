@@ -93,8 +93,16 @@ def check_overlap(db_path: Path, detections: pd.DataFrame, labels: pd.DataFrame,
 
 
 if __name__ == "__main__":
-    labels = load_labels(DB_PATH)
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Check detection results against known labels")
+    parser.add_argument("--db", type=Path, default=None,
+                         help="Path to target database (defaults to config.DB_PATH)")
+    args = parser.parse_args()
+    db_path = args.db or DB_PATH
+
+    labels = load_labels(db_path)
 
     for method in ["zscore", "mahalanobis"]:
-        detections = load_latest_run_detections(DB_PATH, method)
-        check_overlap(DB_PATH, detections, labels, method)
+        detections = load_latest_run_detections(db_path, method)
+        check_overlap(db_path, detections, labels, method)

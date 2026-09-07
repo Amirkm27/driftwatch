@@ -35,4 +35,12 @@ def build_label_bridge(db_path=DB_PATH) -> None:
 
 
 if __name__ == "__main__":
-    build_label_bridge()
+    import argparse
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(description="Populate the label_metrics bridge table")
+    parser.add_argument("--db", type=Path, default=None,
+                         help="Path to target database (defaults to config.DB_PATH)")
+    args = parser.parse_args()
+
+    build_label_bridge(db_path=args.db or DB_PATH)

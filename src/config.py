@@ -2,10 +2,6 @@
 Shared constants for DriftWatch. Single source of truth for anything
 collector.py and database.py both need — or that's likely to get
 tweaked (interval, process count) without either file's logic changing.
-Splitting this out now, while there's only 300 rows in the DB, is cheap;
-doing it after Week 2/3 code starts importing from collector.py and
-database.py directly would mean chasing hardcoded values through more
-files.
 """
 from pathlib import Path
 
@@ -16,6 +12,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = PROJECT_ROOT / "data" / "driftwatch.db"
 LOG_DIR = PROJECT_ROOT / "logs"
+LABELS_CSV_PATH = PROJECT_ROOT / "data" / "labels.csv"
 
 # --- Collection loop ------------------------------------------------------
 DEFAULT_INTERVAL_SECONDS = 30

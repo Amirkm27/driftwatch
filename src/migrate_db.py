@@ -5,11 +5,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from src.config import DB_PATH, NUMERIC_METRICS
+from src.config import DB_PATH, NUMERIC_METRICS, LABELS_CSV_PATH
 from src.db_schema import create_schema, drop_legacy_tables
-
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-LABELS_CSV_PATH = PROJECT_ROOT / "data" / "labels.csv"
 
 
 def backup_database(db_path: Path) -> Path:
@@ -122,4 +119,16 @@ def run_migration(db_path: Path = DB_PATH, labels_path: Path = LABELS_CSV_PATH) 
 
 
 if __name__ == "__main__":
-    run_migration()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Migrate the database to the current schema")
+    parser.add_argument("--db", type=Path, default=None,
+                         help="Path to target database (defaults to config.DB_PATH)")
+    parser.add_argument("--labels-csv", type=Path, default=None,
+                         help="Path to labels.csv (defaults to config.LABELS_CSV_PATH)")
+    args = parser.parse_args()
+
+    run_migration(
+        db_path=args.db or DB_PATH,
+        labels_path=args.labels_csv or LABELS_CSV_PATH,
+    )
