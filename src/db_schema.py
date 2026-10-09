@@ -47,8 +47,7 @@ SCHEMA_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_labels_start_end ON labels (start_ts, end_ts)",
 ]
 
-# features table columns are generated dynamically since they depend on
-# NUMERIC_METRICS, see build_features_table_sql() below
+# Feature columns are generated from the configured numeric metrics.
 
 LEGACY_TABLES_UNAMBIGUOUS = ["baseline_flags", "mahalanobis_flags"]
 
@@ -91,18 +90,8 @@ def create_schema(conn: sqlite3.Connection, numeric_metrics: list) -> None:
 
 def drop_legacy_tables(conn: sqlite3.Connection) -> None:
     """
-    Drops the old bloated tables from before the redesign. Must run
-    BEFORE create_schema(), since the old 'features' table shares its
-    name with the new one — CREATE TABLE IF NOT EXISTS would otherwise
-    silently keep the old bloated version in place. Only call this
-    after confirming you have a backup, since it's destructive.
-
-    baseline_flags and mahalanobis_flags are unambiguous legacy names,
-    safe to drop outright. 'features' is NOT unconditionally dropped —
-    that name is reused by the new thin table, so it's only dropped if
-    it still has the old bloated signature (a bare 'cpu_percent' column,
-    which the new schema never has). Dropping it unconditionally would
-    wipe the current, correct features table on every re-run.
+    Remove legacy tables from older schema versions.
+    The features table is only removed if it matches the old schema.
     """
     cur = conn.cursor()
     for table in LEGACY_TABLES_UNAMBIGUOUS:

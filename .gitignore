@@ -6,27 +6,35 @@ venv/
 __pycache__/
 *.pyc
 *.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
 
 # IDE settings
 .idea/
 *.iml
 .vscode/
 
-# Database files
-data/*.db
-data/*.db-journal
-data/labels.csv
+# Database files (raw telemetry: hostnames, process names)
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
 
-# Logs (folder-level — catches active log AND rotated backups
-# like collector.log.1, collector.log.2, which *.log alone misses)
+# Generated working results
+data/ocsvm_importance.csv
+
+# Notebook generated outputs
+notebooks/data/
+
+# Logs
 logs/
 *.log
 
 # Jupyter notebook checkpoints
 .ipynb_checkpoints/
 
-# Environment variables / secrets (not used yet, ignored preemptively)
+# Environment variables
 .env
 
 # OS junk

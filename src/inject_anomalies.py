@@ -4,18 +4,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.config import DB_PATH, NUMERIC_METRICS, PROJECT_ROOT
+from src.config import DB_PATH, NUMERIC_METRICS, SYNTHETIC_DB_PATH
 from src.db_schema import create_schema
 
-SYNTHETIC_DB_PATH = PROJECT_ROOT / "data" / "driftwatch_synthetic.db"
-
 SEED = 42
-MIN_GAP_ROWS = 5  # buffer kept between injected windows, and between injections and real labeled events
+MIN_GAP_ROWS = 5  # gap between injected events
 
-# (count, duration range in rows) per anomaly type. Rough target: ~10-15%
-# of rows anomalous overall, similar to typical anomaly detection
-# benchmarks — high enough for stable precision/recall numbers, low
-# enough that "anomaly" still means something.
+# number and duration of injected events
 INJECTION_SPECS = {
     "synthetic_cpu_spike": {"count": 8, "duration_range": (4, 8)},
     "synthetic_mem_leak": {"count": 5, "duration_range": (20, 40)},
@@ -33,10 +28,7 @@ def load_real_metrics(db_path: Path = DB_PATH) -> pd.DataFrame:
 
 
 def load_real_labeled_row_positions(db_path: Path, df: pd.DataFrame) -> set:
-    """
-    Positions (not ids) already covered by a real confirmed label, so
-    synthetic injections don't overlap real events and confound the two.
-    """
+    """Return rows already covered by real labels."""
     conn = sqlite3.connect(db_path)
     try:
         labeled_ids = {row[0] for row in conn.execute(
@@ -53,12 +45,7 @@ def load_real_labeled_row_positions(db_path: Path, df: pd.DataFrame) -> set:
 
 def pick_injection_windows(n_rows: int, count: int, duration_range: tuple,
                             excluded_positions: set, rng: np.random.Generator) -> list:
-    """
-    Picks non-overlapping row-position windows, avoiding real labeled
-    positions and each other (with a buffer on both sides so injected
-    effects don't bleed into neighboring windows via the rolling stats
-    features compute later).
-    """
+    """Pick injection windows without overlap."""
     windows = []
     attempts = 0
     max_attempts = count * 200
@@ -74,7 +61,7 @@ def pick_injection_windows(n_rows: int, count: int, duration_range: tuple,
             continue
 
         windows.append((start, end))
-        excluded_positions |= buffered  # reserve this space so later picks don't collide
+        excluded_positions |= buffered
 
     if len(windows) < count:
         print(f"warning: only placed {len(windows)}/{count} windows after {max_attempts} attempts, "
@@ -136,15 +123,10 @@ def build_synthetic_dataset(source_db_path: Path = DB_PATH,
 
         print(f"{label_name}: placed {len(windows)}/{spec['count']} windows")
 
-    # build the target db fresh: injected metrics, real system_info
-    # copied as-is (system_info_id references stay valid), then the
-    # normal analysis schema, empty and ready for features.py/detectors.py
+    # create fresh synthetic database
     conn_src = sqlite3.connect(source_db_path)
     system_info_df = pd.read_sql_query("SELECT * FROM system_info", conn_src)
-    # pull the real CREATE TABLE statements rather than letting pandas
-    # infer a schema from the dataframe — pandas' inferred schema drops
-    # the PRIMARY KEY on metrics.id, which breaks every foreign key that
-    # references it (features, detections, label_metrics all fail)
+    # preserve original table schema
     create_statements = conn_src.execute(
         "SELECT name, sql FROM sqlite_master WHERE type='table' AND name IN ('metrics', 'system_info')"
     ).fetchall()
@@ -158,9 +140,7 @@ def build_synthetic_dataset(source_db_path: Path = DB_PATH,
             conn_tgt.execute(f"DROP TABLE IF EXISTS {table_name}")
             conn_tgt.execute(stmt)
 
-        # system_info must be populated before metrics, since metrics
-        # rows carry a system_info_id foreign key that has to resolve
-        # to an existing row at insert time
+        # insert referenced table first
         system_info_df.to_sql("system_info", conn_tgt, if_exists="append", index=False)
         df.to_sql("metrics", conn_tgt, if_exists="append", index=False)
         create_schema(conn_tgt, NUMERIC_METRICS)
@@ -184,4 +164,14 @@ def build_synthetic_dataset(source_db_path: Path = DB_PATH,
 
 
 if __name__ == "__main__":
-    build_synthetic_dataset()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Build the synthetic anomaly DB from a real DB")
+    parser.add_argument("--source", type=Path, default=DB_PATH,
+                         help="real DB to copy and inject into (defaults to config.DB_PATH)")
+    parser.add_argument("--target", type=Path, default=SYNTHETIC_DB_PATH,
+                         help="synthetic DB to create (defaults to config.SYNTHETIC_DB_PATH)")
+    parser.add_argument("--seed", type=int, default=SEED)
+    args = parser.parse_args()
+
+    build_synthetic_dataset(args.source, args.target, args.seed)

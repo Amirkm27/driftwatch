@@ -1,8 +1,7 @@
 """
-SQLite layer for DriftWatch. Two tables:
-- metrics: one row per snapshot, ~every 30s
-- system_info: one row per collector session — hardware/OS facts that
-  don't change between snapshots, so no point repeating them 1000s of times
+SQLite layer for DriftWatch.
+
+Stores telemetry snapshots and static system information separately.
 """
 import sqlite3
 from contextlib import contextmanager
@@ -12,8 +11,7 @@ from src.config import DB_PATH, TOP_N_PROCESSES
 
 def init_db():
     """
-    Idempotent — safe to call on every startup. Columns grouped by
-    category below just so I can actually find things when scrolling.
+    Creates the required tables and keeps the existing database structure.
     """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with get_connection() as conn:
@@ -58,10 +56,8 @@ def init_db():
 
 def _ensure_process_columns(conn: sqlite3.Connection):
     """
-    Top-N process columns are generated, not hardcoded, because
-    TOP_N_PROCESSES might change later and I don't want to hand-edit
-    the schema if it does. ALTER TABLE only adds what's missing so
-    existing data doesn't get wiped.
+    Generate process columns based on the configured number of tracked processes.
+    Missing columns are added without recreating the table.
     """
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(metrics)")}
 
@@ -80,13 +76,7 @@ def _ensure_process_columns(conn: sqlite3.Connection):
 
 def _ensure_system_info_fk_column(conn: sqlite3.Connection):
     """
-    Links each metrics row to the system_info snapshot that was active
-    when it was collected. Matters once there's more than one machine in
-    the data — without this, GPU columns from an NVIDIA laptop and an
-    AMD desktop are indistinguishable in the raw table. Existing rows
-    from before this column existed are left NULL here; a one-time
-    backfill script handles those since it can't be done safely without
-    knowing which machine actually produced them.
+    Links telemetry rows to the system information record that produced them.
     """
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(metrics)")}
     if "system_info_id" not in existing_cols:
@@ -98,15 +88,8 @@ def _ensure_system_info_fk_column(conn: sqlite3.Connection):
 
 def _create_system_info_table(conn: sqlite3.Connection):
     """
-    Separate table on purpose — CPU model / RAM size / which GPUs exist
-    don't change between snapshots, so shoving them into `metrics` would
-    just mean the same string repeated a few thousand times for nothing.
-    One row per collector run is enough.
-
-    Also this is where the hybrid-GPU thing lives (is_hybrid_gpu_system) —
-    most laptops have both an Intel iGPU and a discrete NVIDIA card, and
-    DriftWatch only tracks the discrete one. This column at least records
-    that the other GPU exists, even though we're not polling it.
+    Stores static hardware information separately from telemetry snapshots.
+    The hybrid GPU flag records systems with multiple GPU devices.
     """
     conn.execute("""
         CREATE TABLE IF NOT EXISTS system_info (
@@ -132,9 +115,7 @@ def _create_system_info_table(conn: sqlite3.Connection):
 @contextmanager
 def get_connection():
     """
-    Wrap every DB touch in this — learned the hard way that leaving a
-    connection open across a whole run loop eventually locks the file
-    if anything else tries to read it (e.g. inspecting the DB mid-run).
+    Provides a managed SQLite connection with cleanup and rollback handling.
     """
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -147,7 +128,7 @@ def get_connection():
 
 
 def _build_process_columns_and_placeholders():
-    """Same generation trick as _ensure_process_columns, just for the INSERT side."""
+    """Generate SQL columns and placeholders for process fields."""
     cols = []
     placeholders = []
     for i in range(1, TOP_N_PROCESSES + 1):
@@ -160,18 +141,14 @@ def _build_process_columns_and_placeholders():
 
 
 def _get_current_system_info_id(conn: sqlite3.Connection):
-    """Most recent system_info row — assumed to describe whatever machine is running right now."""
+    """Return the latest system information record."""
     row = conn.execute("SELECT id FROM system_info ORDER BY recorded_at DESC LIMIT 1").fetchone()
     return row[0] if row else None
 
 
 def insert_metric(record: dict):
     """
-    setdefault(None) on every process column because some snapshots
-    genuinely have fewer than TOP_N_PROCESSES worth of data (or GPU
-    read failed that cycle) — without this, a missing key throws
-    instead of just storing NULL, and I'd rather lose one field than
-    lose the whole row.
+    Fill missing optional process fields with NULL before insertion.
     """
     process_cols, process_placeholders = _build_process_columns_and_placeholders()
 
@@ -214,12 +191,7 @@ def insert_metric(record: dict):
 
 def insert_system_info(record: dict):
     """
-    Only inserts a new row if it differs from the most recent one
-    (ignoring recorded_at/collector_interval_seconds, which change
-    trivially on every restart without reflecting anything meaningful).
-    Otherwise you get one row per debugging restart, which is just
-    noise — a hardware/OS snapshot only needs a new row when the
-    hardware/OS picture actually changes.
+    Insert a new system record only when the hardware or environment changes.
     """
     compare_cols = ["hostname", "os_version", "cpu_model", "ram_total_gb",
                      "gpu_backend", "gpu_names", "is_hybrid_gpu_system"]
@@ -250,7 +222,7 @@ def insert_system_info(record: dict):
 
 
 def get_system_info():
-    """Most recent session first — mostly just for a sanity check in the notebook."""
+    """Return stored system information records."""
     with get_connection() as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.execute("SELECT * FROM system_info ORDER BY recorded_at DESC")
@@ -268,7 +240,7 @@ def get_metrics(limit: int = None):
 
 
 def get_metrics_as_dataframe():
-    """This is basically the only function I actually use once EDA starts."""
+    """Return metrics as a pandas DataFrame for analysis."""
     import pandas as pd
     with get_connection() as conn:
         return pd.read_sql_query("SELECT * FROM metrics ORDER BY timestamp ASC", conn)

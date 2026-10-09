@@ -24,9 +24,7 @@ from src.config import (
 )
 from src.database import init_db, insert_metric, insert_system_info
 
-# --- logging: console + rotating file. leaving at DEBUG for now while
-# I'm still chasing the GPU null issue — bump back to INFO once that's
-# actually confirmed fixed, DEBUG is way too noisy for a week-long run ---
+# Logging output is written to console and a rotating file.
 LOG_DIR.mkdir(exist_ok=True)
 
 logger = logging.getLogger("driftwatch.collector")
@@ -42,10 +40,10 @@ if not logger.handlers:
     logger.addHandler(_console_handler)
     logger.addHandler(_file_handler)
 
-# =====================================================================
+
 # GPU backend — try NVIDIA first (pynvml, official + solid), fall back
 # to AMD (pyadl, unofficial, Windows-only, never tested on real AMD hw)
-# =====================================================================
+
 _GPU_BACKEND = None
 _NVML_HANDLE = None
 _AMD_DEVICE = None
@@ -84,12 +82,7 @@ def get_gpu_metrics() -> tuple[float | None, float | None, float | None]:
             util = pynvml.nvmlDeviceGetUtilizationRates(_NVML_HANDLE)
             gpu_percent = float(util.gpu)
         except (pynvml.NVMLError_NotSupported, pynvml.NVMLError_Unknown):
-            # GPU sitting in a low-power state (P8) with nothing touching
-            # it — utilization query just refuses to answer. Docs/forums
-            # say this throws NotSupported, but on my actual laptop it's
-            # NVMLError_Unknown ("Unknown Error", code 999) — confirmed
-            # by turning DEBUG logging on and reading collector.log.
-            # Either way it means "idle," so call it 0%, not unknown.
+            # Some idle GPU states do not return utilization; treat them as 0%.
             gpu_percent = 0.0
         except Exception as e:
             logger.debug(f"NVIDIA GPU utilization read failed: {e}")
@@ -111,8 +104,7 @@ def get_gpu_metrics() -> tuple[float | None, float | None, float | None]:
         gpu_percent = None
         gpu_temp = None
 
-        # pyadl just doesn't have a VRAM call — not "sometimes fails,"
-        # it flat out doesn't exist, so not even trying.
+        # pyadl does not provide GPU memory usage.
         mem_percent = None
 
         try:
@@ -278,11 +270,11 @@ def get_disk_usage_percent() -> float | None:
         return None
 
 
-# =====================================================================
+
 # disk/net rates — psutil only gives cumulative bytes since boot, which
 # on its own is basically "how long has this machine been on." need the
 # delta between two samples to get anything meaningful.
-# =====================================================================
+
 _prev_io_sample = None
 
 
@@ -498,8 +490,7 @@ def run_collector(interval_seconds: int = DEFAULT_INTERVAL_SECONDS):
                     f"DiskR={record['disk_read_mb_s']}MB/s NetSent={record['net_sent_mb_s']}MB/s"
                 )
             except Exception as e:
-                # data's already collected, just failed to save it —
-                # log the whole record so it's not totally lost
+                # Preserve the collected record in logs when database insertion fails.
                 logger.error(f"DB write failed, snapshot lost: {e} | Record was: {record}")
 
             time.sleep(interval_seconds)

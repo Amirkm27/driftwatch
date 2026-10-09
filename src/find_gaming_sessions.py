@@ -1,19 +1,16 @@
 import sqlite3
-from pathlib import Path
 import pandas as pd
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DB_PATH = PROJECT_ROOT / "data" / "driftwatch.db"
+from src.config import DB_PATH
 
-GPU_SUSTAINED_MIN = 90       # gpu load that counts as "actually playing"
+GPU_SUSTAINED_MIN = 90
 GPU_SUSTAINED_MAX = 100
-GPU_LAUNCH_MIN = 40          # looser gpu floor for pre-game loading/menu screens
-GAP_THRESHOLD_SECONDS = 120       # gap larger than this splits into a new candidate cluster
-SESSION_MERGE_GAP_SECONDS = 300   # clusters within this gap get merged into one session
-                                   # (covers loading screens / menus where gpu drops to 0
-                                   # and the process briefly isn't top of any list)
-MIN_SESSION_SECONDS = 60     # drop short blips that aren't real sessions
-MIN_SUSTAINED_ROWS = 3       # cluster must contain at least this many high-gpu rows to count as real
+GPU_LAUNCH_MIN = 40
+GAP_THRESHOLD_SECONDS = 120
+SESSION_MERGE_GAP_SECONDS = 300
+
+MIN_SESSION_SECONDS = 60
+MIN_SUSTAINED_ROWS = 3
 PROCESS_KEYWORD_DEFAULT = "rainbow"  # case-insensitive
 
 
@@ -28,8 +25,6 @@ def load_raw_metrics(db_path: str = DB_PATH) -> pd.DataFrame:
 
 
 def matches_process(row, keyword: str) -> bool:
-    # checks all top_cpu / top_ram name slots, since the game might show
-    # up in either depending on what it's heaviest on at that moment
     name_cols = [
         "top_cpu_1_name", "top_cpu_2_name", "top_cpu_3_name",
         "top_ram_1_name", "top_ram_2_name", "top_ram_3_name",
@@ -46,11 +41,6 @@ def find_gaming_sessions(df: pd.DataFrame, process_keyword: str = PROCESS_KEYWOR
     process_mask = df.apply(lambda r: matches_process(r, process_keyword), axis=1)
     launch_mask = df["gpu_percent"] >= GPU_LAUNCH_MIN
 
-    # candidate rows are anything that could plausibly be part of a gaming
-    # session: sustained high gpu, OR the process shows up in the top
-    # lists at all, OR gpu is elevated but not yet at "actually playing"
-    # levels (covers loading screens and launch spikes that happen before
-    # gpu load settles into the sustained range)
     candidate_mask = sustained_mask | process_mask | launch_mask
     candidates = df[candidate_mask].copy().sort_values("timestamp").reset_index(drop=True)
     candidates["is_sustained"] = sustained_mask[candidate_mask].values
@@ -62,9 +52,6 @@ def find_gaming_sessions(df: pd.DataFrame, process_keyword: str = PROCESS_KEYWOR
             "start_ts", "end_ts", "duration_s", "process_confirmed", "includes_launch_activity"
         ])
 
-    # stage 1: tight clustering. a menu screen or loading pause can drop
-    # gpu to 0 and briefly push the game out of the top process slots,
-    # which would otherwise fracture one real session into several
     gaps = candidates["timestamp"].diff().dt.total_seconds().fillna(0)
     tight_cluster_id = (gaps > GAP_THRESHOLD_SECONDS).cumsum()
     candidates["tight_cluster_id"] = tight_cluster_id
@@ -80,13 +67,6 @@ def find_gaming_sessions(df: pd.DataFrame, process_keyword: str = PROCESS_KEYWOR
             "first_sustained_ts": sustained_rows.min() if not sustained_rows.empty else pd.NaT,
         })
 
-    # stage 2: attach launch-only lead-ins to the session they belong to.
-    # a cluster that never reaches MIN_SUSTAINED_ROWS on its own is
-    # treated as a launch/loading lead-in and pulled into the *next*
-    # cluster if it qualifies as a real session. two clusters that BOTH
-    # independently qualify are never merged together, since that would
-    # collapse two genuinely separate sessions (e.g. quit and relaunched
-    # later) into one
     sessions = []
     i = 0
     while i < len(clusters):
@@ -95,10 +75,6 @@ def find_gaming_sessions(df: pd.DataFrame, process_keyword: str = PROCESS_KEYWOR
             session_start = c["start"]
             first_sustained_ts = c["first_sustained_ts"]
 
-            # walk backward through preceding non-qualifying clusters and
-            # pull them in as lead-in, as long as the gap to the next
-            # cluster in the chain is short enough to plausibly be a
-            # loading pause rather than a real break
             j = i - 1
             while j >= 0 and clusters[j]["n_sustained"] < MIN_SUSTAINED_ROWS:
                 gap = (clusters[j + 1]["start"] - clusters[j]["end"]).total_seconds()
@@ -110,7 +86,7 @@ def find_gaming_sessions(df: pd.DataFrame, process_keyword: str = PROCESS_KEYWOR
             duration = (c["end"] - session_start).total_seconds()
             if duration >= MIN_SESSION_SECONDS:
                 includes_launch = (
-                    pd.notna(first_sustained_ts) and session_start < first_sustained_ts
+                        pd.notna(first_sustained_ts) and session_start < first_sustained_ts
                 )
                 sessions.append({
                     "start_ts": session_start,
@@ -127,9 +103,9 @@ def find_gaming_sessions(df: pd.DataFrame, process_keyword: str = PROCESS_KEYWOR
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Find gaming sessions by sustained GPU load + process name")
+    parser = argparse.ArgumentParser(description="Find gaming sessions")
     parser.add_argument("--process", type=str, default=PROCESS_KEYWORD_DEFAULT,
-                         help=f"Case-insensitive process name substring to match (default: {PROCESS_KEYWORD_DEFAULT})")
+                        help="Process name substring to match")
     args = parser.parse_args()
 
     df = load_raw_metrics()

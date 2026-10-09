@@ -1,0 +1,5 @@
+start_ts,end_ts,label,source,confidence,notes
+2026-09-03T09:04:19.558486+00:00,2026-09-03T09:05:22.631568+00:00,ram_spike,synthetic,confirmed,Injected via python script. a short bursts - battery plugged
+2026-09-03T09:08:00.066504+00:00,2026-09-03T09:08:32.212405+00:00,ram_spike,synthetic,confirmed,Injected via python script. a short bursts - battery unplugged
+2026-09-03T08:29:41.029634+00:00,2026-09-03T08:51:55.588435+00:00,cpu_stress,real:prime95,confirmed,"Sustained ~100% CPU, ~22 min. Primary Prime95 torture-test run."
+2026-09-02T19:24:40.946212+00:00,2026-09-02T20:02:11.961476+00:00,gaming_gpu_load,real:rainbowsix,confirmed,"Full session incl. launch and mid-match lull, sustained GPU 90-100%, ~37.5 min, process-confirmed"
